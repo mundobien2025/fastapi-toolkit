@@ -2,7 +2,22 @@
 
 ## 0.5.4 — 2026-08-11
 
-- TODO: describe changes
+### Corregido (seguridad)
+
+- **`BaseService.retrieve`/`update`/`delete` (Beanie y SQLAlchemy) ahora
+  aplican `get_filters()`.** Antes solo `list()` lo hacía — cualquier
+  service con scoping por tenant/owner en `get_filters()` quedaba IDOR-able
+  vía `retrieve(id)`/`update(id, ...)`/`delete(id)`, pese a que el propio
+  `CLAUDE.md` documentaba `service.retrieve(id)` como el camino
+  scope-seguro. Sin override de `get_filters()` (el caso común), cero
+  cambio de comportamiento.
+- Nuevo `BaseService.owner_filter(field, value)` (Beanie): resuelve la
+  clave Mongo correcta para un filtro de ownership sobre un campo `Link`
+  según si la query corre agregada (`list()`) o plana (`retrieve`/
+  `update`/`delete`) — evita que cada consumidor tenga que conocer ese
+  detalle interno de Beanie a mano.
+- `Repository.get_by_id`/`get`/`get_with_joins` (ambos ORMs) aceptan
+  `filters=` opcional.
 
 
 ## 0.5.3 — 2026-08-01
