@@ -242,3 +242,76 @@ async def test_scoped_filter_merges_with_user_filter(seeded):
     svc_t1 = ScopedItemService(repository=ItemRepo(), tenant="t1")
     items, total = await svc_t1.list(filters={"active": True}, count=50)
     assert {i.name for i in items} == {"Alpha"}  # t1 + active
+
+
+# ---------------------------------------------------------------------------
+# get_filters scoping en retrieve/update/delete (IDOR — CLAUDE.md prometía
+# esto ["Si necesitas un objeto por id con scope, usa `service.retrieve(id)`"]
+# pero `retrieve`/`update`/`delete` llamaban `repository.get_by_id(id)`
+# directo, bypasseando `get_filters()` igual que un `get_by_id` crudo. Un
+# `ScopedItemService` (tenant t2) podía leer/editar/borrar un Item de t1
+# solo con adivinar/enumerar su id. Fix: `retrieve`/`update`/`delete` ahora
+# pasan `filters=self.get_filters()` a `repository.get_by_id`.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_retrieve_respects_scope_own_tenant_ok(seeded):
+    svc_t1 = ScopedItemService(repository=ItemRepo(), tenant="t1")
+    got = await svc_t1.retrieve(str(seeded[0].id))  # Alpha, tenant t1
+    assert got.name == "Alpha"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_cross_tenant_id_is_not_found(seeded):
+    """El id de Gamma (t2) existe de verdad — pedido desde un service
+    scopeado a t1 debe comportarse como si no existiera (404), no leakear
+    el registro de otro tenant."""
+    svc_t1 = ScopedItemService(repository=ItemRepo(), tenant="t1")
+    with pytest.raises(NotFoundException):
+        await svc_t1.retrieve(str(seeded[2].id))  # Gamma, tenant t2
+
+    # El mismo id SÍ resuelve para el tenant dueño.
+    svc_t2 = ScopedItemService(repository=ItemRepo(), tenant="t2")
+    got = await svc_t2.retrieve(str(seeded[2].id))
+    assert got.name == "Gamma"
+
+
+@pytest.mark.asyncio
+async def test_update_cross_tenant_id_is_not_found_and_not_modified(seeded):
+    svc_t1 = ScopedItemService(repository=ItemRepo(), tenant="t1")
+    with pytest.raises(NotFoundException):
+        await svc_t1.update(str(seeded[2].id), ItemUpdate(qty=999))
+
+    # No se modificó — lo confirma el dueño real (t2).
+    svc_t2 = ScopedItemService(repository=ItemRepo(), tenant="t2")
+    unchanged = await svc_t2.retrieve(str(seeded[2].id))
+    assert unchanged.qty == 9
+
+
+@pytest.mark.asyncio
+async def test_delete_cross_tenant_id_is_not_found_and_not_deleted(seeded):
+    svc_t1 = ScopedItemService(repository=ItemRepo(), tenant="t1")
+    with pytest.raises(NotFoundException):
+        await svc_t1.delete(str(seeded[2].id))
+
+    # Sigue existiendo — lo confirma el dueño real (t2).
+    svc_t2 = ScopedItemService(repository=ItemRepo(), tenant="t2")
+    still_there = await svc_t2.retrieve(str(seeded[2].id))
+    assert still_there.name == "Gamma"
+
+
+@pytest.mark.asyncio
+async def test_unscoped_service_retrieve_update_delete_unaffected(seeded):
+    """Retrocompatibilidad: un service SIN override de `get_filters` (el
+    caso común, `get_filters` devuelve `{}`) sigue viendo/editando/borrando
+    cualquier id — cero cambio de comportamiento para el 99% de los
+    services existentes que no scopean por owner."""
+    svc = ItemService(repository=ItemRepo())
+    got = await svc.retrieve(str(seeded[2].id))  # Gamma, sin scoping
+    assert got.name == "Gamma"
+
+    updated = await svc.update(str(seeded[2].id), ItemUpdate(qty=42))
+    assert updated.qty == 42
+
+    res = await svc.delete(str(seeded[2].id))
+    assert res == "deleted"

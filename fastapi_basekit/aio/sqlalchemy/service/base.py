@@ -122,9 +122,10 @@ class BaseService(Generic[ModelT]):
         if joins is None:
             joins = kwargs.get("joins")
 
-        obj = await self.repository.get_with_joins(id, joins=joins)
+        filters = self.get_filters()
+        obj = await self.repository.get_with_joins(id, joins=joins, filters=filters)
         if not obj:
-            obj = await self.repository.get(id)
+            obj = await self.repository.get(id, filters=filters)
         if not obj:
             raise NotFoundException(f"id={id} no encontrado")
         return obj
@@ -227,6 +228,12 @@ class BaseService(Generic[ModelT]):
         return created
 
     async def update(self, id: str, data: BaseModel | Dict[str, Any]) -> ModelT:
+        # Scoping de seguridad ANTES de tocar nada — `repository.update`
+        # fetchea por PK cruda internamente (sin `get_filters()`), así que
+        # sin este check un id de otro tenant se podía editar directo.
+        scoped = await self.repository.get(id, filters=self.get_filters())
+        if not scoped:
+            raise NotFoundException(f"id={id} no encontrado")
         update_data = (
             data.model_dump(exclude_unset=True)
             if isinstance(data, BaseModel)
@@ -277,7 +284,7 @@ class BaseService(Generic[ModelT]):
         return True
 
     async def delete(self, id: str) -> bool:
-        obj = await self.repository.get(id)
+        obj = await self.repository.get(id, filters=self.get_filters())
         if not obj:
             raise NotFoundException(message=f"id={id} no encontrado")
         return await self.apply_delete(obj)

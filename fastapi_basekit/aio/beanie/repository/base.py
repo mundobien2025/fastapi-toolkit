@@ -119,6 +119,103 @@ class BaseRepository(Generic[ModelT]):
             kwargs["projection"] = projection
         return kwargs
 
+    def _is_link_field(self, field_name: str) -> bool:
+        """Verifica si un campo del modelo es de tipo Link (o Optional[Link])."""
+        model_fields = (
+            self.model.model_fields
+            if hasattr(self.model, "model_fields")
+            else {}
+        )
+        field_info = model_fields.get(field_name)
+        if not field_info:
+            return False
+
+        field_type = field_info.annotation
+        origin = get_origin(field_type)
+
+        # Caso directo: Link[Model]
+        if origin is Link:
+            return True
+
+        # Caso Optional[Link[Model]] = Union[Link[Model], None]
+        # O cualquier Union que contenga Link
+        if origin is not None:
+            args = get_args(field_type)
+            for arg in args:
+                arg_origin = get_origin(arg)
+                if arg_origin is Link:
+                    return True
+
+        return False
+
+    @staticmethod
+    def _coerce_objectid(value: Any) -> Any:
+        """str/UUID → ObjectId para queries Mongo sobre Link.id."""
+        if isinstance(value, ObjectId):
+            return value
+        if isinstance(value, str):
+            try:
+                return ObjectId(value)
+            except Exception:
+                return value
+        return value
+
+    def _resolve_filter_query_args(self, filters: dict = None) -> list:
+        """Traduce un dict de `get_filters()` a los args posicionales que
+        acepta `Model.find()`/`Model.find_one()` — resuelve campos Link
+        (directos y el alias `<field>_id`), pasa claves Mongo crudas
+        (`"user.$id"`, `"$or"`, ...) como dict, y avisa (no falla en
+        silencio) si una clave no resuelve a nada del modelo.
+
+        Compartido por `build_filter_query` (listados) y `get_by_id`
+        (retrieve/update/delete escopeados) — mismo motor de resolución de
+        filtros para las dos rutas, así un `get_filters()` de seguridad
+        protege ambas por igual."""
+        exprs: list = []
+        raw_filters: Dict[str, Any] = {}
+
+        for k, v in (filters or {}).items():
+            # MongoDB-style keys (dot-notation like "user.$id" or operators like "$or")
+            # cannot be resolved via hasattr — pass them as a raw dict to find()
+            if "." in k or k.startswith("$"):
+                raw_filters[k] = v
+                continue
+
+            if hasattr(self.model, k):
+                field_attr = getattr(self.model, k)
+                if self._is_link_field(k):
+                    exprs.append(field_attr.id == self._coerce_objectid(v))
+                else:
+                    exprs.append(field_attr == v)
+                continue
+
+            # `<field>_id` alias para Link fields. Permite filtros con
+            # `customer_id`, `user_id`, etc. sin que el caller deba conocer
+            # la sintaxis Mongo nested. Sólo se activa si <field> existe en
+            # el modelo y es un Link[X].
+            if k.endswith("_id"):
+                base = k[:-3]
+                if hasattr(self.model, base) and self._is_link_field(base):
+                    field_attr = getattr(self.model, base)
+                    exprs.append(field_attr.id == self._coerce_objectid(v))
+                    continue
+
+            # Clave no resoluble (typo, campo inexistente, nesting mal escrito).
+            # Se descarta — pero se AVISA: si la clave venía de `get_filters`
+            # (scoping por tenant/owner), su desaparición silenciosa deja el
+            # listado/retrieve SIN ese filtro. El warning hace visible la
+            # pérdida en logs/Sentry en vez de fallar en silencio.
+            logger.warning(
+                "_resolve_filter_query_args: filtro '%s' descartado (no "
+                "resuelve a ningún campo de %s). Si era un filtro de "
+                "scoping, la query queda SIN ese filtro.",
+                k,
+                getattr(self.model, "__name__", self.model),
+            )
+
+        # Raw MongoDB filters go first so Beanie processes them as a dict condition
+        return ([raw_filters] if raw_filters else []) + exprs
+
     def build_filter_query(
         self,
         search: Optional[str],
@@ -144,98 +241,13 @@ class BaseRepository(Generic[ModelT]):
                 )
             )
 
-        # Obtener campos del modelo
-        model_fields = (
-            self.model.model_fields
-            if hasattr(self.model, "model_fields")
-            else {}
-        )
-
-        def _is_link_field(field_name: str) -> bool:
-            """Verifica si un campo es de tipo Link."""
-            field_info = model_fields.get(field_name)
-            if not field_info:
-                return False
-
-            field_type = field_info.annotation
-            origin = get_origin(field_type)
-
-            # Caso directo: Link[Model]
-            if origin is Link:
-                return True
-
-            # Caso Optional[Link[Model]] = Union[Link[Model], None]
-            # O cualquier Union que contenga Link
-            if origin is not None:
-                args = get_args(field_type)
-                for arg in args:
-                    # Verificar si el argumento es Link
-                    arg_origin = get_origin(arg)
-                    if arg_origin is Link:
-                        return True
-
-            return False
-
-        raw_filters: Dict[str, Any] = {}
-
-        def _coerce_objectid(value: Any) -> Any:
-            """str/UUID → ObjectId para queries Mongo sobre Link.id."""
-            if isinstance(value, ObjectId):
-                return value
-            if isinstance(value, str):
-                try:
-                    return ObjectId(value)
-                except Exception:
-                    return value
-            return value
-
-        for k, v in (filters or {}).items():
-            # MongoDB-style keys (dot-notation like "user.$id" or operators like "$or")
-            # cannot be resolved via hasattr — pass them as a raw dict to find()
-            if "." in k or k.startswith("$"):
-                raw_filters[k] = v
-                continue
-
-            if hasattr(self.model, k):
-                field_attr = getattr(self.model, k)
-                if _is_link_field(k):
-                    exprs.append(field_attr.id == _coerce_objectid(v))
-                else:
-                    exprs.append(field_attr == v)
-                continue
-
-            # `<field>_id` alias para Link fields. Permite filtros con
-            # `customer_id`, `user_id`, etc. sin que el caller deba conocer
-            # la sintaxis Mongo nested. Sólo se activa si <field> existe en
-            # el modelo y es un Link[X].
-            if k.endswith("_id"):
-                base = k[:-3]
-                if hasattr(self.model, base) and _is_link_field(base):
-                    field_attr = getattr(self.model, base)
-                    exprs.append(field_attr.id == _coerce_objectid(v))
-                    continue
-
-            # Clave no resoluble (typo, campo inexistente, nesting mal escrito).
-            # Se descarta — pero se AVISA: si la clave venía de `get_filters`
-            # (scoping por tenant/owner), su desaparición silenciosa deja el
-            # listado sin filtrar → fuga cross-tenant (IDOR). El warning hace
-            # visible la pérdida en logs/Sentry en vez de fallar en silencio.
-            logger.warning(
-                "build_filter_query: filtro '%s' descartado (no resuelve a "
-                "ningún campo de %s). Si era un filtro de scoping, el listado "
-                "queda SIN ese filtro.",
-                k,
-                getattr(self.model, "__name__", self.model),
-            )
-
-        # Raw MongoDB filters go first so Beanie processes them as a dict condition
-        query_args: list = ([raw_filters] if raw_filters else []) + exprs
+        query_args: list = exprs + self._resolve_filter_query_args(filters)
         query = self.model.find(*query_args, **self._get_query_kwargs(**kwargs))
-        
+
         # Apply ordering if provided
         if order_by:
             query = query.sort(order_by)
-        
+
         return query
 
     async def paginate(
@@ -521,10 +533,40 @@ class BaseRepository(Generic[ModelT]):
     async def get_by_id(
         self,
         obj_id: Union[str, ObjectId],
+        filters: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Optional[ModelT]:
+        """`filters` (opcional) — scoping de seguridad (típicamente
+        `Service.get_filters()`, ej. `{"user.$id": request.state.user.id}`).
+        Sin `filters`, comportamiento idéntico a antes (busca por id, sin
+        scope) — 100% retrocompatible. Con `filters`, un id que existe pero
+        no matchea el scope devuelve `None` (mismo resultado que "no
+        encontrado"), cerrando la clase de IDOR de "conozco el id de otro
+        tenant y lo pido directo".
+
+        El chequeo de scope corre SIEMPRE con `fetch_links=False` (find_one
+        plano, sobre el documento crudo — DBRef sin resolver), sea cual sea
+        el `fetch_links` que pida el caller para el fetch final. Motivo:
+        Beanie reescribe `find(..., fetch_links=True)` a una aggregation con
+        `$lookup`, y un filtro con notación de punto (`"user.$id"`,
+        `"user._id"`, etc.) puede matchear distinto — o no matchear nada —
+        según si corre ANTES o DESPUÉS del `$lookup` (mismo bug ya
+        documentado en `find_all_production_for_user` de pulbot-backend:
+        "fetch_links=True puede descartar resultados silenciosamente al
+        filtrar por campos dict anidados"). Combinar scope-filter +
+        fetch_links en una sola query es frágil; separarlos lo hace
+        determinístico sin importar qué `get_filters()` use cada service."""
         if not isinstance(obj_id, ObjectId):
             obj_id = ObjectId(obj_id)
+
+        if filters:
+            scope_exprs = self._resolve_filter_query_args(filters)
+            scoped = await self.model.find_one(
+                self.model.id == obj_id, *scope_exprs, fetch_links=False
+            )
+            if not scoped:
+                return None
+
         return await self.model.find_one(
             self.model.id == obj_id,
             **self._get_query_kwargs(**kwargs),

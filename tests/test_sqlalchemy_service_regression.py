@@ -132,6 +132,79 @@ async def test_get_filters_scoping(seeded, session):
 
 
 # ---------------------------------------------------------------------------
+# get_filters scoping en retrieve/update/delete (IDOR — mismo fix que en
+# Beanie: `retrieve`/`update`/`delete` llamaban al repo por PK cruda,
+# bypasseando `get_filters()`. Un service scopeado por `name="Ana"` podía
+# leer/editar/borrar el registro de "Beto" solo con adivinar su id.)
+# ---------------------------------------------------------------------------
+
+def _ana_scoped_service(session):
+    class AnaScopedService(UserService):
+        def get_filters(self, filters=None):
+            filters = super().get_filters(filters)
+            filters["name"] = "Ana"
+            return filters
+
+    return AnaScopedService(repository=UserRepository(db=session), request=None)
+
+
+@pytest.mark.asyncio
+async def test_retrieve_respects_scope_own_record_ok(seeded, session):
+    svc = _ana_scoped_service(session)
+    got = await svc.retrieve(str(seeded[0].id))  # Ana
+    assert got.name == "Ana"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_out_of_scope_id_is_not_found(seeded, session, service):
+    svc = _ana_scoped_service(session)
+    with pytest.raises(NotFoundException):
+        await svc.retrieve(str(seeded[1].id))  # Beto, existe pero no matchea el scope
+
+    # El mismo id sí resuelve para un service sin ese scope.
+    got = await service.retrieve(str(seeded[1].id))
+    assert got.name == "Beto"
+
+
+@pytest.mark.asyncio
+async def test_update_out_of_scope_id_is_not_found_and_not_modified(
+    seeded, session, service
+):
+    svc = _ana_scoped_service(session)
+    with pytest.raises(NotFoundException):
+        await svc.update(str(seeded[1].id), UserUpdateSchema(name="Hijacked"))
+
+    unchanged = await service.retrieve(str(seeded[1].id))
+    assert unchanged.name == "Beto"
+
+
+@pytest.mark.asyncio
+async def test_delete_out_of_scope_id_is_not_found_and_not_deleted(
+    seeded, session, service
+):
+    svc = _ana_scoped_service(session)
+    with pytest.raises(NotFoundException):
+        await svc.delete(str(seeded[1].id))
+
+    still_there = await service.retrieve(str(seeded[1].id))
+    assert still_there.name == "Beto"
+
+
+@pytest.mark.asyncio
+async def test_unscoped_service_retrieve_update_delete_unaffected(seeded, service):
+    """Retrocompatibilidad: sin override de `get_filters` (el caso común),
+    cero cambio de comportamiento."""
+    got = await service.retrieve(str(seeded[1].id))
+    assert got.name == "Beto"
+
+    updated = await service.update(str(seeded[1].id), UserUpdateSchema(name="Beto2"))
+    assert updated.name == "Beto2"
+
+    ok = await service.delete(str(seeded[1].id))
+    assert ok is True
+
+
+# ---------------------------------------------------------------------------
 # Fix issue #7: aislamiento de mutable-defaults por instancia
 # ---------------------------------------------------------------------------
 

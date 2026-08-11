@@ -82,9 +82,43 @@ class BaseService(Generic[ModelT]):
         filters = filters or {}
         return filters
 
+    def owner_filter(self, field: str, value: Any) -> Dict[str, Any]:
+        """Filtro de scoping por un campo `Link` (ej. ownership por
+        `user`), correcto tanto en `list()` como en `retrieve`/`update`/
+        `delete` — sin que el service tenga que conocer por qué la clave
+        Mongo cambia entre esos dos caminos.
+
+        Por qué existen dos claves para "lo mismo": un campo `Link[User]`
+        se guarda como DBRef (`{"$ref": "users", "$id": ObjectId(...)}`).
+        - `retrieve`/`update`/`delete` van por `get_by_id`, que SIEMPRE
+          resuelve el scope con `fetch_links=False` (`find_one` plano sobre
+          el documento crudo) — ahí el DBRef está intacto, la clave correcta
+          es `"<field>.$id"`.
+        - `list()` (y cualquier action cuyo `get_kwargs_query()` pida
+          `fetch_links=True`) corre `Model.find(..., fetch_links=True)`,
+          que Beanie reescribe a una aggregation con `$lookup` — ahí el
+          `$lookup` REEMPLAZA el DBRef por el subdocumento resuelto, así
+          que la clave correcta pasa a ser `"<field>._id"`.
+        Usar la clave equivocada no tira error — devuelve 0 resultados en
+        silencio (bug real ya encontrado usando esto a mano en
+        `ToolService` de pulbot-backend, 2026-08-11). Este helper decide
+        por vos: usalo en vez de escribir `"<field>.$id"`/`"<field>._id"`
+        directo en tu `get_filters()`.
+
+        ⚠️ Asume que tu action de lectura-por-id (`retrieve`/`update`/
+        `delete`) no fuerza `fetch_links=True` en el PROPIO chequeo de
+        scope — así es como quedó `get_by_id` del repo (siempre
+        `fetch_links=False` para el scope-check, independientemente del
+        `fetch_links` que pidas para el fetch final). Si tu repo está
+        parcheado para saltarse eso, este helper no aplica."""
+        suffix = "._id" if self.action == "list" else ".$id"
+        return {f"{field}{suffix}": value}
+
     async def retrieve(self, id: str) -> ModelT:
         kwargs = self.get_kwargs_query()
-        obj = await self.repository.get_by_id(id, **kwargs)
+        obj = await self.repository.get_by_id(
+            id, filters=self.get_filters(), **kwargs
+        )
         if not obj:
             raise NotFoundException(f"id={id} no encontrado")
         return obj
@@ -241,7 +275,9 @@ class BaseService(Generic[ModelT]):
 
     async def update(self, id: str, data: BaseModel) -> ModelT:
         kwargs = self.get_kwargs_query()
-        obj = await self.repository.get_by_id(id, **kwargs)
+        obj = await self.repository.get_by_id(
+            id, filters=self.get_filters(), **kwargs
+        )
         if not obj:
             raise NotFoundException(f"id={id} no encontrado")
         if isinstance(data, BaseModel):
@@ -250,7 +286,7 @@ class BaseService(Generic[ModelT]):
         return updated
 
     async def delete(self, id: str) -> str:
-        obj = await self.repository.get_by_id(id)
+        obj = await self.repository.get_by_id(id, filters=self.get_filters())
         if not obj:
             raise NotFoundException(f"id={id} no encontrado")
         await self.repository.delete(obj)

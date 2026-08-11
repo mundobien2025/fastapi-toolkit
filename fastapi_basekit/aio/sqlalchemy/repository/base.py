@@ -487,16 +487,37 @@ class BaseRepository(Generic[ModelT]):
 
         return record
 
-    async def get(self, record_id: Union[str, UUID]) -> Optional[ModelT]:
-        """Obtiene un registro por su ID."""
+    async def get(
+        self,
+        record_id: Union[str, UUID],
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ModelT]:
+        """Obtiene un registro por su ID.
+
+        `filters` (opcional) — scoping de seguridad (típicamente
+        `Service.get_filters()`). Sin `filters`, usa `session.get()` (fast
+        path por PK) — comportamiento idéntico a antes, 100% retrocompatible.
+        Con `filters`, cae a un `SELECT ... WHERE id = :id AND <filtros>` —
+        un id que existe pero no matchea el scope devuelve `None` (mismo
+        resultado que "no encontrado"), cerrando la clase de IDOR de "conozco
+        el id de otro tenant y lo pido directo"."""
         if not self.model:
             raise ValueError("El modelo no está definido en el repositorio")
-        return await self.session.get(self.model, record_id)
+        if not filters:
+            return await self.session.get(self.model, record_id)
+        conditions = [self.model.id == record_id] + self._build_conditions(
+            filters=filters
+        )
+        return await self._get_one(conditions=conditions)
 
-    async def get_by_id(self, record_id: Union[str, UUID]) -> Optional[ModelT]:
+    async def get_by_id(
+        self,
+        record_id: Union[str, UUID],
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ModelT]:
         """Alias de `get(id)` — nombre unificado con el repo Beanie
         (`get_by_id`) para que las lecturas por id sean portables entre ORMs."""
-        return await self.get(record_id)
+        return await self.get(record_id, filters=filters)
 
     async def get_by_field(
         self, field_name: str, value: Any
@@ -509,11 +530,15 @@ class BaseRepository(Generic[ModelT]):
         self,
         record_id: Union[str, UUID],
         joins: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> Optional[ModelT]:
-        """Obtiene un registro por ID y carga relaciones dinámicamente."""
-        return await self._get_one(
-            conditions=[self.model.id == record_id], joins=joins
-        )
+        """Obtiene un registro por ID y carga relaciones dinámicamente.
+
+        `filters` (opcional) — mismo scoping de seguridad que `get()`."""
+        conditions = [self.model.id == record_id]
+        if filters:
+            conditions.extend(self._build_conditions(filters=filters))
+        return await self._get_one(conditions=conditions, joins=joins)
 
     async def get_by_field_with_joins(
         self,
