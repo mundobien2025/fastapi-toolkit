@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4 — 2026-08-11
+
+- TODO: describe changes
+
+
 ## 0.5.3 — 2026-08-01
 
 - TODO: describe changes

@@ -1,6 +1,6 @@
 {
   "name": "fastapi-basekit",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Skills and conventions for projects using fastapi-basekit (SQLAlchemy async CBV pattern)",
   "author": {
     "name": "Jerson Moreno",
